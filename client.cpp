@@ -19,8 +19,37 @@
 
 using namespace std;
 
+#include <mutex>
+
 int SocketFD;
 bool running = true;
+
+/* Estado local del tic tac toe: solo es una COPIA del tablero que manda el
+   servidor. Sirve para dibujar y para validaciones locales baratas (ej: no
+   mandar una posicion ya ocupada). Nunca se dibuja nada sin que el servidor
+   lo confirme. */
+string localBoard(9, '-');
+char mySymbol = 0;
+mutex boardMtx;
+
+void printBoard(const string &b)
+{
+    cout << "\n";
+    for (int r = 0; r < 3; r++)
+    {
+        cout << "  ";
+        for (int c = 0; c < 3; c++)
+        {
+            char ch = b[r * 3 + c];
+            /* Las casillas vacias muestran su numero (1..9) para saber que elegir */
+            cout << (ch == '-' ? char('1' + r * 3 + c) : ch);
+            if (c < 2) cout << " | ";
+        }
+        cout << "\n";
+        if (r < 2) cout << "  ---------\n";
+    }
+    cout << endl;
+}
 
 /* -------------------------------------------------------------------- */
 /* Devuelve solo el nombre de archivo de una ruta (sin directorios)     */
@@ -223,6 +252,73 @@ void ThreadReadServer(int S)
                  << msg << "\n> " << flush;
         }
         
+        else if (buff[0] == 'T')
+        {
+            /* Ser->Cli: 'T' + 9 bytes = tablero completo */
+            n = readExact(S, buff, 9);
+            if (n <= 0) break;
+            {
+                lock_guard<mutex> lock(boardMtx);
+                localBoard = string(buff, 9);
+                cout << "\n[TRAMA RECIBIDA] T | " << localBoard << endl;
+                printBoard(localBoard);
+            }
+            cout << "> " << flush;
+        }
+        else if (buff[0] == 'S')
+        {
+            /* Ser->Cli: 'S' + simbolo asignado */
+            n = readExact(S, buff, 1);
+            if (n <= 0) break;
+            mySymbol = buff[0];
+            cout << "\n[Partida iniciada] Juegas con '" << mySymbol << "'\n> " << flush;
+        }
+        else if (buff[0] == 'W')
+        {
+            cout << "\n[Esperando a un oponente...]\n> " << flush;
+        }
+        else if (buff[0] == 'U')
+        {
+            /* Ser->Cli: 'U' + simbolo = es tu turno */
+            n = readExact(S, buff, 1);
+            if (n <= 0) break;
+            cout << "\n[TU TURNO] Eres '" << buff[0] << "'. Elige una posicion: /x <1-9>\n> " << flush;
+        }
+        else if (buff[0] == 'G')
+        {
+            /* Ser->Cli: 'G' + 'X' | 'O' | 'D' = game over */
+            n = readExact(S, buff, 1);
+            if (n <= 0) break;
+            char r = buff[0];
+            cout << "\n[GAME OVER] ";
+            if (r == 'D')
+                cout << "Empate.";
+            else if (mySymbol == 0)
+                cout << "Gano '" << r << "'.";
+            else if (r == mySymbol)
+                cout << "¡Ganaste!";
+            else
+                cout << "Perdiste.";
+            cout << "\n> " << flush;
+            mySymbol = 0;
+        }
+        else if (buff[0] == 'e')
+        {
+            /* Ser->Cli: 'e' + codigo de error del juego */
+            n = readExact(S, buff, 1);
+            if (n <= 0) break;
+            const char *txt = "Error desconocido";
+            switch (buff[0])
+            {
+                case '1': txt = "Posicion ocupada."; break;
+                case '2': txt = "No es tu turno."; break;
+                case '3': txt = "Posicion invalida (usa 1-9)."; break;
+                case '4': txt = "No estas en una partida."; break;
+                case '5': txt = "No puedes unirte (ya inscrito o partida en curso). Usa /v para ver."; break;
+            }
+            cout << "\n[Error de juego] " << txt << "\n> " << flush;
+        }
+
         /* otros bytes de accion desconocidos se ignoran */
     }
 }
@@ -297,6 +393,9 @@ int main(int argc, char *argv[])
     cout << "  /b <mensaje>          -> mensaje a todos (broadcast)" << endl;
     cout << "  /f <nick> <ruta>      -> enviar archivo a un usuario" << endl;
     cout << "  lista                 -> listar usuarios conectados" << endl;
+    cout << "  /p                    -> quiero jugar tic tac toe" << endl;
+    cout << "  /v                    -> quiero ver la partida (viewer)" << endl;
+    cout << "  /x <1-9>              -> mover en la posicion indicada" << endl;
     cout << "  /q                    -> salir" << endl;
 
     string line;
@@ -429,6 +528,47 @@ int main(int argc, char *argv[])
             write(SocketFD, frame.c_str(), frame.size());
             running = false;
         }
+        else if (line == "/p")
+        {
+            /* Quiero jugar: el servidor me empareja con otro jugador */
+            cout << "[TRAMA ENVIADA] P" << endl;
+            write(SocketFD, "P", 1);
+        }
+        else if (line == "/v")
+        {
+            /* Quiero ver la partida como espectador */
+            cout << "[TRAMA ENVIADA] V" << endl;
+            write(SocketFD, "V", 1);
+        }
+        else if (line.substr(0, 2) == "/x")
+        {
+            /* Movimiento: /x <1-9> */
+            char pos = (line.size() >= 4) ? line[3] : 0;
+            if (line.size() != 4 || pos < '1' || pos > '9')
+            {
+                cout << "Uso: /x <1-9>" << endl;
+            }
+            else
+            {
+                bool taken;
+                {
+                    lock_guard<mutex> lock(boardMtx);
+                    taken = (localBoard[pos - '1'] != '-');
+                }
+                /* Validacion LOCAL: evita ir al servidor por algo que ya sabemos que es invalido */
+                if (taken)
+                {
+                    cout << "La posicion " << pos << " ya esta ocupada." << endl;
+                }
+                else
+                {
+                    string f = "X";
+                    f += pos;
+                    cout << "[TRAMA ENVIADA] X | " << pos << endl;
+                    write(SocketFD, f.c_str(), f.size());
+                }
+            }
+        }
         else if (line == "lista")
         {
             /* La solicitud de lista solo necesita enviar la accion L. */
@@ -440,7 +580,7 @@ int main(int argc, char *argv[])
         }
         else
         {
-            cout << "Comando no reconocido. Usa /m, /b, lista o /q." << endl;
+            cout << "Comando no reconocido. Usa /m, /b, /f, /p, /v, /x, lista o /q." << endl;
         }
     }
 
